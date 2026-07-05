@@ -297,7 +297,22 @@
   .foot-links a{color:var(--muted)}
 
   .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-  .turnstile-shell{max-width:360px;margin:16px auto 0}
+  .verification-panel{max-width:620px;margin:16px auto 0;padding:14px 16px;border:1px solid var(--line);border-radius:12px;background:#f8faff;text-align:left}
+  .verification-copy{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+  .verification-label{display:block;color:var(--text);font-size:14px;font-weight:700}
+  .verification-text{display:block;margin-top:3px;color:var(--muted);font-size:13px;line-height:1.45}
+  .verification-panel[data-state="checking"]{border-color:#b9cdfd;background:#f4f7ff}
+  .verification-panel[data-state="success"]{border-color:#9bd5c3;background:#f2fbf7}
+  .verification-panel[data-state="error"]{border-color:#f1b8b8;background:#fff7f7}
+  .verification-panel[data-state="success"] .verification-label{color:#08775b}
+  .verification-panel[data-state="error"] .verification-label{color:#a23737}
+  .verification-retry{display:none;flex:0 0 auto;border:0;background:transparent;color:var(--primary);font:inherit;font-size:13px;font-weight:700;cursor:pointer;padding:2px 0}
+  .verification-panel[data-state="error"] .verification-retry{display:inline-block}
+  .turnstile-shell{max-width:360px;margin:12px auto 0;min-height:65px}
+  @media(max-width:520px){
+    .verification-copy{display:block}
+    .verification-retry{margin-top:8px}
+  }
   @media(prefers-reduced-motion:reduce){
     html{scroll-behavior:auto}
     *,*::before,*::after{scroll-behavior:auto!important;transition:none!important}
@@ -382,7 +397,16 @@
           </div>
         </div>
 
-        <div class="turnstile-shell"><div id="turnstile"></div></div>
+        <div class="verification-panel" id="verificationPanel" data-state="loading" aria-live="polite">
+          <div class="verification-copy">
+            <div>
+              <strong class="verification-label" id="verificationLabel">Loading human verification</strong>
+              <span class="verification-text" id="verificationText">Please wait a moment before choosing your HEIC photos.</span>
+            </div>
+            <button type="button" class="verification-retry" id="verificationRetry">Try again</button>
+          </div>
+          <div class="turnstile-shell"><div id="turnstile"></div></div>
+        </div>
         <div class="app-notice" id="appNotice" role="alert"></div>
         <div class="files" id="files" aria-live="polite"></div>
         <div class="bar" id="downloadAllBar" style="display:none;text-align:center;margin-top:16px">
@@ -552,6 +576,10 @@
   var downloadAllBtn = document.getElementById('downloadAllBtn');
   var fmtBtns = document.querySelectorAll('.segmented button');
   var turnstileEl = document.getElementById('turnstile');
+  var verificationPanel = document.getElementById('verificationPanel');
+  var verificationLabel = document.getElementById('verificationLabel');
+  var verificationText = document.getElementById('verificationText');
+  var verificationRetry = document.getElementById('verificationRetry');
   var appNotice = document.getElementById('appNotice');
 
   document.getElementById('year').textContent = new Date().getFullYear();
@@ -565,33 +593,79 @@
     appNotice.style.display = message ? 'block' : 'none';
   }
 
-  // ---- Cloudflare Turnstile (challenge runs when user clicks "Select HEIC files") ----
+  // ---- Cloudflare Turnstile + mandatory Vercel server-side validation ----
   var TURNSTILE_SITEKEY = '0x4AAAAAADv0SKj32B4EIPxf'; // Cloudflare Turnstile site key
   var turnstileWidgetId = null;
-  var verified = false;         // becomes true once a valid token is issued
+  var verified = false;          // true only after /api/verify-turnstile accepts the token
+  var verificationBusy = false;
   var pendingOpenPicker = false; // waiting to open the file picker after the challenge
   var pendingFiles = null;       // dropped files waiting to be added after the challenge
+  var turnstileReady = false;
+  var turnstileUnavailable = false;
 
-  window.onTurnstileOk = function(){
-    verified = true;
-    proceedPending();
+  function setVerificationState(state, label, text){
+    verificationPanel.setAttribute('data-state', state);
+    verificationLabel.textContent = label;
+    verificationText.textContent = text;
+  }
+
+  function clearPending(){
+    pendingOpenPicker = false;
+    pendingFiles = null;
+  }
+
+  function resetVerification(message){
+    verified = false;
+    verificationBusy = false;
+    turnstileUnavailable = false;
+    if(turnstileWidgetId !== null && typeof turnstile !== 'undefined'){
+      try{ turnstile.reset(turnstileWidgetId); }catch(e){}
+    }
+    setVerificationState('ready', 'Human verification ready', message || 'Choose photos or drop them here to begin the secure check.');
+  }
+
+  window.onTurnstileOk = function(token){
+    verificationBusy = true;
+    setVerificationState('checking', 'Checking verification', 'Confirming the result securely with our server.');
+    fetch('/api/verify-turnstile', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token: token})
+    }).then(function(response){
+      return response.json().catch(function(){ return {}; }).then(function(data){
+        if(!response.ok || !data.success) throw new Error('server-rejected');
+        verified = true;
+        verificationBusy = false;
+        setVerificationState('success', 'Verification passed', 'You can now choose or drop your HEIC photos.');
+        showNotice('');
+        proceedPending();
+      });
+    }).catch(function(){
+      clearPending();
+      verified = false;
+      verificationBusy = false;
+      setVerificationState('error', 'Verification was not completed', 'Please retry. Files stay on your device and cannot be selected until verification passes.');
+      showNotice('Human verification failed. Please try again.');
+      if(turnstileWidgetId !== null && typeof turnstile !== 'undefined'){
+        try{ turnstile.reset(turnstileWidgetId); }catch(e){}
+      }
+    });
   };
   window.onTurnstileExpired = function(){
-    verified = false; // force a fresh challenge next time
+    clearPending();
+    resetVerification('The previous check expired. Choose photos to verify again.');
   };
   window.onTurnstileError = function(){
+    clearPending();
     verified = false;
-    if(pendingOpenPicker || pendingFiles){
-      pendingOpenPicker = false;
-      pendingFiles = null;
-      showNotice('Verification failed. Please try again.');
-    }
+    verificationBusy = false;
+    turnstileUnavailable = true;
+    setVerificationState('error', 'Verification is unavailable', 'Check your connection or content blocker, then try again.');
+    showNotice('Human verification is required before selecting files.');
   };
 
-  var turnstileReady = false;   // true once the widget is rendered and can be executed
-  var turnstileFailed = false;  // true if the API never loads (e.g. restricted network) → fail open
-
-  // Render the invisible widget; it only runs when we call turnstile.execute()
+  // Render a visible managed widget. The challenge executes when files are requested.
   function renderTurnstile(){
     if(turnstileWidgetId !== null) return;
     if(typeof turnstile === 'undefined' || typeof turnstile.render !== 'function') return;
@@ -599,28 +673,38 @@
       turnstileWidgetId = turnstile.render(turnstileEl, {
         sitekey: TURNSTILE_SITEKEY,
         size: 'flexible',
-        appearance: 'interaction-only',
+        appearance: 'always',
         execution: 'execute',
+        action: 'convert',
         callback: window.onTurnstileOk,
         'expired-callback': window.onTurnstileExpired,
         'error-callback': window.onTurnstileError
       });
       turnstileReady = true;
-    }catch(e){ turnstileFailed = true; }
+      turnstileUnavailable = false;
+      setVerificationState('ready', 'Human verification ready', 'Choose photos or drop them here to begin the secure check.');
+    }catch(e){
+      turnstileUnavailable = true;
+      setVerificationState('error', 'Verification could not start', 'Check your connection or content blocker, then try again.');
+    }
   }
 
-  // Poll for the Turnstile API to finish loading; fail open if it never does.
+  // Poll briefly for the Turnstile API. Verification fails closed if it cannot load.
   (function waitForTurnstile(tries){
     if(turnstileReady) return;
     if(typeof turnstile !== 'undefined' && typeof turnstile.render === 'function'){
       renderTurnstile();
       return;
     }
-    if(tries <= 0){ turnstileFailed = true; return; } // give up → allow the tool to work
+    if(tries <= 0){
+      turnstileUnavailable = true;
+      setVerificationState('error', 'Verification could not load', 'Check your connection or content blocker, then try again.');
+      return;
+    }
     setTimeout(function(){ waitForTurnstile(tries - 1); }, 300);
   })(20); // ~6s grace period
 
-  // Resolve pending actions once verification succeeds OR is unavailable
+  // Resolve the action only after both Turnstile and the server accept the check.
   function proceedPending(){
     if(pendingOpenPicker){ pendingOpenPicker = false; fileInput.click(); }
     if(pendingFiles){ var f = pendingFiles; pendingFiles = null; addFiles(f); }
@@ -796,12 +880,17 @@
     });
   }
 
-  // Run the Turnstile challenge before opening the file picker (once per session).
-  // If the widget isn't ready yet (or failed to load), open directly so the user
-  // gesture isn't lost — verification is enforced once the widget is available.
+  // Never fail open: files stay inaccessible until server-side validation succeeds.
   function requestFilePicker(){
-    if(verified || turnstileFailed || !turnstileReady){ fileInput.click(); return; }
+    if(verified){ fileInput.click(); return; }
+    if(!turnstileReady){
+      showNotice(turnstileUnavailable ? 'Human verification is unavailable. Use Try again after checking your connection.' : 'Human verification is still loading. Please try again in a moment.');
+      return;
+    }
+    if(verificationBusy) return;
     pendingOpenPicker = true;
+    showNotice('');
+    setVerificationState('checking', 'Starting verification', 'Complete the check below if Cloudflare asks for interaction.');
     turnstile.execute(turnstileWidgetId);
   }
 
@@ -818,9 +907,22 @@
   });
   dropzone.addEventListener('drop', function(e){
     if(!(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length)) return;
-    if(verified || turnstileFailed || !turnstileReady){ addFiles(e.dataTransfer.files); return; }
+    if(verified){ addFiles(e.dataTransfer.files); return; }
+    if(!turnstileReady){
+      showNotice(turnstileUnavailable ? 'Human verification is unavailable. Use Try again after checking your connection.' : 'Human verification is still loading. Please try again in a moment.');
+      return;
+    }
+    if(verificationBusy) return;
     pendingFiles = e.dataTransfer.files;
+    showNotice('');
+    setVerificationState('checking', 'Starting verification', 'Complete the check below if Cloudflare asks for interaction.');
     turnstile.execute(turnstileWidgetId);
+  });
+
+  verificationRetry.addEventListener('click', function(){
+    showNotice('');
+    if(!turnstileReady){ window.location.reload(); return; }
+    resetVerification();
   });
 
   fmtBtns.forEach(function(b){
