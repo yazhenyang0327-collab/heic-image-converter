@@ -303,11 +303,11 @@
   .foot-links a{color:var(--muted)}
 
   .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-  .verification-panel{max-width:620px;margin:16px auto 0;padding:14px 16px;border:1px solid var(--line);border-radius:12px;background:#f8faff;text-align:left}
+  .verification-panel{display:none;max-width:620px;margin:16px auto 0;padding:14px 16px;border:1px solid var(--line);border-radius:12px;background:#f8faff;text-align:left}
   .verification-copy{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
   .verification-label{display:block;color:var(--text);font-size:14px;font-weight:700}
   .verification-text{display:block;margin-top:3px;color:var(--muted);font-size:13px;line-height:1.45}
-  .verification-panel[data-state="checking"]{border-color:#b9cdfd;background:#f4f7ff}
+  .verification-panel[data-state="interactive"]{display:block;border-color:#b9cdfd;background:#f4f7ff}
   .verification-panel[data-state="success"]{border-color:#9bd5c3;background:#f2fbf7}
   .verification-panel[data-state="error"]{border-color:#f1b8b8;background:#fff7f7}
   .verification-panel[data-state="success"] .verification-label{color:#08775b}
@@ -608,6 +608,7 @@
   var pendingFiles = null;       // dropped files waiting to be added after the challenge
   var turnstileReady = false;
   var turnstileUnavailable = false;
+  var verificationBypassed = false;
 
   function setVerificationState(state, label, text){
     verificationPanel.setAttribute('data-state', state);
@@ -620,10 +621,22 @@
     pendingFiles = null;
   }
 
+  function bypassVerification(reason){
+    verified = false;
+    verificationBusy = false;
+    turnstileUnavailable = true;
+    verificationBypassed = true;
+    setVerificationState('bypassed', 'Verification skipped', '');
+    showNotice('');
+    if(window.console && console.info) console.info('Turnstile skipped:', reason || 'unavailable');
+    proceedPending();
+  }
+
   function resetVerification(message){
     verified = false;
     verificationBusy = false;
     turnstileUnavailable = false;
+    verificationBypassed = false;
     if(turnstileWidgetId !== null && typeof turnstile !== 'undefined'){
       try{ turnstile.reset(turnstileWidgetId); }catch(e){}
     }
@@ -663,23 +676,18 @@
     resetVerification('The previous check expired. Choose photos to verify again.');
   };
   window.onTurnstileError = function(errorCode){
-    clearPending();
-    verified = false;
-    verificationBusy = false;
-    turnstileUnavailable = true;
-    var codeText = errorCode ? ' Error code: ' + errorCode + '.' : '';
-    setVerificationState('error', 'Verification is unavailable', 'Cloudflare could not complete the check.' + codeText + ' Please try again.');
-    showNotice('Human verification is required before selecting files.' + codeText);
     if(window.console && console.warn) console.warn('Turnstile error:', errorCode || 'unknown');
-    return false;
+    bypassVerification(errorCode || 'challenge-error');
+    return true;
   };
   window.onTurnstileUnsupported = function(){
-    clearPending();
-    verified = false;
-    verificationBusy = false;
-    turnstileUnavailable = true;
-    setVerificationState('error', 'Browser is not supported', 'Update your browser or try another current browser.');
-    showNotice('This browser cannot complete human verification.');
+    bypassVerification('unsupported-browser');
+  };
+  window.onTurnstileInteractive = function(){
+    setVerificationState('interactive', 'Complete the security check', 'Cloudflare needs a quick interaction before files can be selected.');
+  };
+  window.onTurnstileAfterInteractive = function(){
+    setVerificationState('checking', 'Checking verification', '');
   };
 
   // Render a visible managed widget. The challenge executes when files are requested.
@@ -690,22 +698,22 @@
       turnstileWidgetId = turnstile.render(turnstileEl, {
         sitekey: TURNSTILE_SITEKEY,
         size: 'flexible',
-        appearance: 'always',
+        appearance: 'interaction-only',
         execution: 'execute',
         action: 'convert',
-        retry: 'auto',
-        'retry-interval': 8000,
+        retry: 'never',
         callback: window.onTurnstileOk,
         'expired-callback': window.onTurnstileExpired,
         'error-callback': window.onTurnstileError,
-        'unsupported-callback': window.onTurnstileUnsupported
+        'unsupported-callback': window.onTurnstileUnsupported,
+        'before-interactive-callback': window.onTurnstileInteractive,
+        'after-interactive-callback': window.onTurnstileAfterInteractive
       });
       turnstileReady = true;
       turnstileUnavailable = false;
       setVerificationState('ready', 'Human verification ready', 'Choose photos or drop them here to begin the secure check.');
     }catch(e){
-      turnstileUnavailable = true;
-      setVerificationState('error', 'Verification could not start', 'Check your connection or content blocker, then try again.');
+      bypassVerification('render-failed');
     }
   }
   window.renderTurnstileWidget = renderTurnstile;
@@ -719,8 +727,7 @@
       return;
     }
     if(tries <= 0){
-      turnstileUnavailable = true;
-      setVerificationState('error', 'Verification could not load', 'Check your connection or content blocker, then try again.');
+      bypassVerification('script-load-timeout');
       return;
     }
     setTimeout(function(){ waitForTurnstile(tries - 1); }, 300);
@@ -902,17 +909,17 @@
     });
   }
 
-  // Never fail open: files stay inaccessible until server-side validation succeeds.
+  // Prefer verification, but keep this browser-only tool usable if Turnstile is unavailable.
   function requestFilePicker(){
-    if(verified){ fileInput.click(); return; }
+    if(verified || verificationBypassed){ fileInput.click(); return; }
     if(!turnstileReady){
-      showNotice(turnstileUnavailable ? 'Human verification is unavailable. Use Try again after checking your connection.' : 'Human verification is still loading. Please try again in a moment.');
+      pendingOpenPicker = true;
       return;
     }
     if(verificationBusy) return;
     pendingOpenPicker = true;
     showNotice('');
-    setVerificationState('checking', 'Starting verification', 'Complete the check below if Cloudflare asks for interaction.');
+    setVerificationState('checking', 'Starting verification', '');
     turnstile.execute(turnstileWidgetId);
   }
 
@@ -929,15 +936,15 @@
   });
   dropzone.addEventListener('drop', function(e){
     if(!(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length)) return;
-    if(verified){ addFiles(e.dataTransfer.files); return; }
+    if(verified || verificationBypassed){ addFiles(e.dataTransfer.files); return; }
     if(!turnstileReady){
-      showNotice(turnstileUnavailable ? 'Human verification is unavailable. Use Try again after checking your connection.' : 'Human verification is still loading. Please try again in a moment.');
+      pendingFiles = e.dataTransfer.files;
       return;
     }
     if(verificationBusy) return;
     pendingFiles = e.dataTransfer.files;
     showNotice('');
-    setVerificationState('checking', 'Starting verification', 'Complete the check below if Cloudflare asks for interaction.');
+    setVerificationState('checking', 'Starting verification', '');
     turnstile.execute(turnstileWidgetId);
   });
 
